@@ -1,0 +1,47 @@
+# Dependency autopilot. Every pull request this opens is handed to GitHub's auto-merge by
+# workflows/dependabot-auto-merge.yml, and the `ci` check required on `main` decides: it builds the
+# image with Nix and smoke-tests it, so a bump that breaks the image sits unmerged and says why.
+#
+# Nothing here leaves a hash for a human to refresh. The flake has one input (nixpkgs), and every
+# npm package is fetched by the integrity package-lock.json records (importNpmLock in flake.nix).
+version: 2
+
+updates:
+  # @jxsuite/server and everything under it. This is how a jx release reaches the image.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
+    groups:
+      npm:
+        applies-to: version-updates
+        patterns: ["*"]
+    # Version updates wait three days by default, which is a supply-chain quarantine worth keeping
+    # for third parties but not for jx's own releases: they are published with provenance from
+    # jxsuite/jx, and the image should follow a release the day it ships.
+    cooldown:
+      default-days: 3
+      exclude: ["@jxsuite/*"]
+
+  # nixpkgs: Bun, glibc and the CA bundle the image runs on. Weekly, because nixpkgs-unstable moves
+  # several times a day and each bump is a full image rebuild.
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 3
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        applies-to: version-updates
+        patterns: ["*"]

@@ -1,0 +1,103 @@
+# Hands every Dependabot pull request to GitHub's auto-merge, so a green `ci` merges it and a red one
+# leaves it open. Adapted from jxsuite/jx, whose copy carries the full reasoning.
+#
+# THIS WORKFLOW DOES NOT MERGE ANYTHING. It asks GitHub to merge once `main`'s ruleset is satisfied:
+#
+#   * `gh pr merge --auto` FAILS OPEN: with no required check it performs an ordinary merge, and it
+#     treats UNSTABLE (only non-required checks red) as mergeable now (cli/cli#13880). So this calls
+#     the `enablePullRequestAutoMerge` mutation, which errors instead of merging.
+#   * And first it asserts `ci` is a required check on the default branch. If the ruleset is ever
+#     deleted, Dependabot pull requests stop merging and say why, rather than merging untested.
+#
+# A merge made this way raises no `push` event (GitHub's own token), which is why ci.yml also runs
+# on a schedule: that is what publishes the image for a dependency merge.
+name: Dependabot auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  enable:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.repository == 'jxsuite/package-manager'
+    runs-on: ubuntu-latest
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: The gate this delegates to must actually exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          contexts="$(gh api "repos/${GH_REPO}/rules/branches/${DEFAULT_BRANCH}" \
+            --jq '[.[] | select(.type == "required_status_checks")
+                       | .parameters.required_status_checks[].context] | join(",")')"
+          echo "required status checks on ${DEFAULT_BRANCH}: ${contexts:-<none>}"
+          case ",${contexts}," in
+            *,ci,*) ;;
+            *)
+              echo "::error::\`ci\` is not a required status check on ${DEFAULT_BRANCH}, so"\
+                   "auto-merge has nothing to wait for and this pull request would merge untested."\
+                   "Restore the branch ruleset before re-running."
+              exit 1
+              ;;
+          esac
+
+      - name: Hand the pull request to auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          set -uo pipefail
+          echo "::notice::${UPDATE_TYPE:-unknown update} of ${DEPENDENCIES:-unknown dependencies}"
+
+          # `$pr` is a GraphQL variable bound by `-F pr=`, hence the single quotes.
+          # shellcheck disable=SC2016
+          if out="$(gh api graphql -F pr="$PR_NODE_ID" -f query='
+              mutation($pr: ID!) {
+                enablePullRequestAutoMerge(input: { pullRequestId: $pr, mergeMethod: SQUASH }) {
+                  pullRequest { number }
+                }
+              }' 2>&1)"; then
+            echo "auto-merge enabled on $PR_URL"
+            exit 0
+          fi
+
+          echo "$out"
+          case "$out" in
+            *"already enabled"*|*"Auto merge is already"*)
+              echo "::notice::auto-merge was already enabled on $PR_URL"
+              exit 0
+              ;;
+            # Every required check is already green, so GitHub will not schedule a merge for a state
+            # it can satisfy now. This is not the fail-open case: the gate above has been met.
+            *"Clean status"*|*"clean status"*|*"not in a mergeable state"*)
+              echo "::notice::$PR_URL is already mergeable; merging now"
+              exec gh pr merge --squash "$PR_URL"
+              ;;
+            *"not allowed"*)
+              echo "::error::Auto-merge is disabled for this repository."\
+                   "Settings -> General -> Pull Requests -> Allow auto-merge."
+              exit 1
+              ;;
+          esac
+          echo "::error::Could not enable auto-merge on $PR_URL"
+          exit 1

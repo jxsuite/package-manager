@@ -1,0 +1,88 @@
+# Builds the image with Nix, smoke-tests it, and on `main` pushes it to ghcr.io.
+#
+# The job is named `ci` because the ruleset on `main` requires exactly that check, and Dependabot's
+# auto-merge (dependabot-auto-merge.yml) waits on it. A pull request builds and tests; only `main`
+# publishes.
+#
+# WHY THERE IS A SCHEDULE. Dependabot pull requests are merged by GitHub's auto-merge on behalf of
+# GITHUB_TOKEN, and GitHub starts no `push` workflow for an event its own token raised. So the merge
+# commit of every dependency bump, which is most of this repository's history, would never be
+# published by `push` alone. The hourly run publishes any `main` revision that is not on ghcr.io yet
+# and exits in seconds when it is.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Is this revision already published?
+        id: published
+        if: env.PUBLISH == 'true' && github.event_name == 'schedule'
+        run: |
+          if docker manifest inspect "$IMAGE:sha-$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "::notice::$IMAGE:sha-$GITHUB_SHA is already published"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+        if: steps.published.outputs.skip != 'true'
+        with:
+          # Plain Nix is all the flake needs; left on, determinate-nixd tries to log into FlakeHub
+          # on every run and annotates a green build with the failure.
+          determinate: false
+
+      - name: Build the image
+        if: steps.published.outputs.skip != 'true'
+        run: |
+          nix build .#image --print-build-logs --out-link image
+          ./image | docker load
+
+      - name: Smoke test
+        if: steps.published.outputs.skip != 'true'
+        run: scripts/smoke.sh "$IMAGE:latest"
+
+      - name: Push
+        if: env.PUBLISH == 'true' && steps.published.outputs.skip != 'true'
+        run: |
+          server="$(jq -r '.dependencies["@jxsuite/server"]' package.json)"
+          for tag in "sha-$GITHUB_SHA" "server-$server" latest; do
+            docker tag "$IMAGE:latest" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")"
+          {
+            echo "### Published"
+            echo
+            echo "\`$digest\`"
+            echo
+            echo "Tags: \`sha-$GITHUB_SHA\`, \`server-$server\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

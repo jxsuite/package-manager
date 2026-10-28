@@ -1,0 +1,11 @@
+{
+  "name": "@jxsuite/package-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jx's lockfile-only package service, built with Nix as a container image for the Jx cloud platform",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@jxsuite/server": "7.0.0"
+  }
+}
