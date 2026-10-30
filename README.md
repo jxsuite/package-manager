@@ -1,6 +1,6 @@
 # Jx package manager image
 
-The container image the [Jx cloud platform](https://jxsuite.com) runs its package service in: `@jxsuite/server/packages-service` on Bun, built with Nix. Studio's add, remove and update-versions operations for a cloud project run here, lockfile-only. Nothing is installed: the service resolves against the public npm registry, runs no install script, and answers with the project's new `package.json` and `package-lock.json`.
+The container image the [Jx cloud platform](https://jxsuite.com) runs its package service in: `@jxsuite/server/packages-service` on Node, built with Nix. Studio's add, remove and update-versions operations for a cloud project run here, lockfile-only. Nothing is installed: the service resolves against the public npm registry, runs no install script, and answers with the project's new `package.json` and `package-lock.json`.
 
 ```
 ghcr.io/jxsuite/package-manager:latest
@@ -28,7 +28,9 @@ nix build .#image
 scripts/smoke.sh ghcr.io/jxsuite/package-manager:latest
 ```
 
-The image is about 260 MB uncompressed: Bun, glibc, the CA bundle and `@jxsuite/server`'s dependency tree. Interpreter shebangs inside `node_modules` are rewritten to `/usr/bin/env` so that neither Node nor Python is pulled in, and the build refuses either one as a reference.
+The image is about 210 MB uncompressed: Node 24 (slim, no npm), glibc, the CA bundle, and the service. Node is the runtime the desktop app's backend runs the same installer on, so the cloud and the desktop answer a package operation the same way.
+
+`@jxsuite/server` publishes TypeScript sources, which Node will not strip inside `node_modules`, so the build compiles `entry.ts` and everything it reaches into one ESM bundle with esbuild, as the desktop app does for its backend. `@npmcli/arborist` stays outside the bundle because it finds its own helpers by path at run time, and `scripts/prune-modules.mjs` cuts `node_modules` down to Arborist and its dependencies. Interpreter shebangs inside `node_modules` are rewritten to `/usr/bin/env` so that the full Node (with npm) and Python stay out, and the build refuses either one, Bun, or esbuild as a reference.
 
 ## Using it from Cloudflare Containers
 
