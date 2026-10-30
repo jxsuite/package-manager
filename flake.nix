@@ -28,12 +28,21 @@
               ./package.json
               ./package-lock.json
               ./entry.ts
+              ./scripts/prune-modules.mjs
             ];
           };
 
-          # The service is `@jxsuite/server/packages-service` and nothing else. Bun runs it rather than
-          # Node because @jxsuite/server publishes TypeScript sources, which Node will not strip
-          # inside node_modules.
+          # The runtime is Node, the version line Electron's desktop backend runs the same installer on,
+          # so the cloud and the desktop answer a package operation identically. Slim, because npm is
+          # only needed by the build.
+          node = pkgs.nodejs-slim_24;
+
+          # The service is `@jxsuite/server/packages-service` and nothing else, built the way the
+          # desktop app builds its backend. @jxsuite/server publishes TypeScript sources, which Node
+          # will not strip inside node_modules, so esbuild compiles entry.ts and everything it reaches
+          # into one ESM bundle for Node. Arborist stays out of it, because it finds helpers of its
+          # own by path at run time (node-gyp's, @npmcli/run-script's), and node_modules is cut down
+          # to Arborist and its dependencies.
           service = pkgs.buildNpmPackage {
             pname = "jx-package-service";
             inherit (manifest) version;
@@ -48,27 +57,49 @@
             # the native addons @jxsuite/server's other entry points carry are never loaded.
             npmFlags = [ "--ignore-scripts" ];
             npmRebuildFlags = [ "--ignore-scripts" ];
-            dontNpmBuild = true;
             dontPatchShebangs = true;
             disallowedReferences = [
+              pkgs.bun
+              pkgs.esbuild
               pkgs.nodejs
               pkgs.python3
             ];
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [
+              pkgs.esbuild
+              pkgs.makeWrapper
+            ];
+            # `#serve` resolves to its Node side under esbuild's default conditions. ws's optional
+            # native speedups are `require`d inside a try and are not installed, so they stay
+            # external; the banner gives the ESM bundle the `require` its inlined CommonJS calls.
+            buildPhase = ''
+              runHook preBuild
+              esbuild entry.ts --bundle --platform=node --format=esm --target=node24 \
+                --external:@npmcli/arborist --external:bufferutil --external:utf-8-validate \
+                --banner:js="import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" \
+                --outfile=dist/index.mjs
+              if grep -Eq '\bBun\.[A-Za-z]+' dist/index.mjs; then
+                echo "the service bundle calls a Bun API; it runs on Node" >&2
+                exit 1
+              fi
+              node scripts/prune-modules.mjs node_modules @npmcli/arborist
+              runHook postBuild
+            '';
+
             installPhase = ''
               runHook preInstall
               mkdir -p $out/lib/jx-package-service $out/bin
               # npm's hidden lockfile records each package's `resolved` as the store path importNpmLock
               # fetched it to, which would carry every tarball into the image beside its unpacked copy.
-              rm node_modules/.package-lock.json
-              cp -r node_modules package.json entry.ts $out/lib/jx-package-service/
+              rm -f node_modules/.package-lock.json
+              cp -r node_modules $out/lib/jx-package-service/
+              cp dist/index.mjs $out/lib/jx-package-service/
               # npmConfigHook points the packages' scripts at Nix's interpreters (Node for bin scripts,
               # Python for node-gyp). Nothing here runs them, and each reference would put another
               # runtime in the image, so they go back to the `env` form they were published with.
               grep -rlZ '^#!/nix/store/' $out/lib | xargs -0 -r sed -i '1s|^#!/nix/store/[^/]*/bin/|#!/usr/bin/env |'
-              makeWrapper ${lib.getExe pkgs.bun} $out/bin/jx-package-service \
-                --add-flags $out/lib/jx-package-service/entry.ts
+              makeWrapper ${lib.getExe node} $out/bin/jx-package-service \
+                --add-flags $out/lib/jx-package-service/index.mjs
               runHook postInstall
             '';
 
@@ -110,8 +141,8 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.bun
-            pkgs.nodejs
+            pkgs.esbuild
+            pkgs.nodejs_24
           ];
         };
       });
