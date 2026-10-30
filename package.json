@@ -6,6 +6,6 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@jxsuite/server": "7.0.0"
+    "@jxsuite/server": "8.0.0"
   }
 }
